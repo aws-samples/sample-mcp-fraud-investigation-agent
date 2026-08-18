@@ -1,0 +1,22 @@
+TRANSACTION VELOCITY MONITORING RULES
+
+Purpose: Detect unusual transaction patterns that may indicate fraud.
+
+Threshold Rules:
+- Single transaction exceeding 4x customer average order value = FLAG for review
+- Multiple transactions within 1 hour exceeding 2x daily average = FLAG for review
+- New payment method + high value transaction = ELEVATED risk
+
+Geographic Rules:
+- Transaction from city different than typical shipping address = ANOMALY signal
+- Transaction from country different than account country = HIGH ANOMALY signal
+- Multiple transactions from different cities within 24 hours = VELOCITY anomaly
+
+Device Rules:
+- Unknown device fingerprint = ANOMALY signal
+- Device fingerprint mismatch with account history = ELEVATED risk
+- Multiple accounts from same device = FRAUD indicator
+
+Time-Based Rules:
+- Transaction outside customer normal shopping hours = ANOMALY signal
+- Transaction between 1 AM and 5 AM local time = ELEVATED risk window

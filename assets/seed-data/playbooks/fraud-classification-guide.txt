@@ -1,0 +1,28 @@
+FRAUD CLASSIFICATION AND SCORING GUIDE
+
+Classification Categories:
+1. ACCOUNT TAKEOVER - Unauthorized access to existing account
+2. SYNTHETIC IDENTITY - Fabricated identity using real and fake information
+3. FRIENDLY FRAUD - Legitimate customer disputing valid charges
+4. CARD NOT PRESENT - Stolen card details used for online purchase
+5. RETURN FRAUD - Abuse of return policies
+
+Scoring Model:
+- Each anomaly signal adds points to the fraud score
+- Spending anomaly: +15 points
+- Geographic anomaly: +20 points
+- Device anomaly: +15 points
+- Time anomaly: +10 points
+- Credential change anomaly: +25 points
+- Prior fraud history: +25 points
+
+Confidence Levels:
+- 0-25 points: LOW - Monitor only
+- 26-50 points: MEDIUM - Manual review required
+- 51-75 points: HIGH - Automatic hold, expedited review
+- 76+ points: CRITICAL - Immediate action required
+
+Repeat Target Indicator:
+- Customers with prior unauthorized activity cases are considered REPEAT TARGETS
+- Repeat targets receive +25 bonus points to fraud score
+- Repeat targets trigger automatic escalation regardless of score

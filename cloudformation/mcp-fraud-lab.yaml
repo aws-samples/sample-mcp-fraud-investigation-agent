@@ -1,0 +1,2718 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MCP in Action: AI-Powered E-Commerce Fraud Investigation Workshop.
+  Deploys Amplify dashboard, DynamoDB tables (imported from S3), S3 buckets for
+  support cases and fraud playbooks, a Bedrock Managed Knowledge Base for the
+  fraud playbooks, two API Gateway REST APIs (DynamoDB + S3 direct integration),
+  AgentCore Gateway with 3 MCP targets, AgentCore Runtime (Strands SDK agent
+  with SSE streaming and JWT auth), Cognito user pool, and all required IAM roles.
+  Zero Lambda in the runtime path - dashboard calls AgentCore directly.
+
+# ---------------------------------------------------------------------------
+# Rules - Region Restriction
+# ---------------------------------------------------------------------------
+Rules:
+  RegionRestriction:
+    Assertions:
+      - Assert:
+          Fn::Contains:
+            - - us-west-2
+            - !Ref AWS::Region
+        AssertDescription: >
+          This workshop can only be deployed in us-west-2 (Oregon).
+          Please switch to that region and try again.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: fraud
+    Description: Prefix for resource names to avoid collisions.
+    AllowedPattern: '^[a-z0-9-]{1,20}$'
+
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: Foundation model ID for the AgentCore Runtime agent.
+
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Embedding model for the Bedrock Knowledge Base.
+
+  AssetsBucketName:
+    Type: String
+    Default: mcp-fraud-agent-workshop-test
+    Description: >
+      Name of the S3 bucket that holds seed-bundle.zip. The SeedBootstrap custom
+      resource reads the bundle using its IAM role (S3 API, no public access needed,
+      Block Public Access can stay fully on) and self-populates all seed data into
+      buckets in this account, so the attendee never pre-stages anything and never
+      touches the CLI. In a hosted Workshop Studio event, pass {{.AssetsBucketName}}.
+  AssetsObjectKey:
+    Type: String
+    Default: seed-bundle.zip
+    Description: >
+      S3 key of the seed bundle within AssetsBucketName. In a hosted Workshop Studio
+      event, pass {{.AssetsBucketPrefix}}seed-bundle.zip to include the workshop prefix.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # 0. KMS KEY - Customer-managed key for data-at-rest encryption
+  #   Shared customer-managed key used by the DynamoDB tables, the ECR
+  #   repository, and the CodeBuild project. The key policy grants the account
+  #   root full control (so IAM policies govern access) plus direct usage to the
+  #   AWS services that encrypt on the stack's behalf. Automatic rotation is on.
+  #   The key is deleted with the stack on workshop teardown, so it incurs only
+  #   prorated cost for the lifetime of the event.
+  #   Note: the Secrets Manager secret intentionally stays on the AWS-managed
+  #   key. The workshop output asks the attendee to read that secret with the
+  #   CLI, and a customer-managed key would require granting every attendee
+  #   kms:Decrypt just to read their own generated password.
+  # =========================================================================
+  WorkshopKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub 'Customer-managed encryption key for the ${StackPrefix} fraud investigation workshop'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: workshop-key-policy
+        Statement:
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowServiceUse
+            Effect: Allow
+            Principal:
+              Service:
+                - dynamodb.amazonaws.com
+                - ecr.amazonaws.com
+                - codebuild.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncryptFrom
+              - kms:ReEncryptTo
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+
+  # =========================================================================
+  # 0b. SHARED DEAD LETTER QUEUE for the CloudFormation custom-resource Lambdas
+  #   The custom-resource Lambdas below are invoked synchronously by
+  #   CloudFormation, so this DLQ is a defense-in-depth control rather than an
+  #   active failure path (sync invocations surface errors directly in stack
+  #   events). It is encrypted with the shared customer-managed key.
+  # =========================================================================
+  FunctionDlq:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub '${StackPrefix}-${AWS::Region}-cr-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref WorkshopKmsKey
+      KmsDataKeyReusePeriodSeconds: 300
+
+  # Managed policy (attached to the 7 custom-resource roles) granting send
+  # access to the DLQ and use of the key that encrypts it. Delivered as a
+  # managed policy rather than inline to keep the shared grant in one place.
+  FunctionDlqAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${StackPrefix}-${AWS::Region}-cr-dlq-access'
+      Roles:
+        - !Ref WorkshopUserCreatorRole
+        - !Ref SeedBootstrapRole
+        - !Ref BucketCleanupRole
+        - !Ref KBSyncRole
+        - !Ref AgentSourceUploaderRole
+        - !Ref SecretInjectorRole
+        - !Ref AmplifyDeployRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt FunctionDlq.Arn
+          - Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !GetAtt WorkshopKmsKey.Arn
+
+  # =========================================================================
+  # 0c. ACCESS LOG BUCKET - S3 server access logging target for every bucket
+  #   in this stack. It is the log destination, so it does not log to itself.
+  # =========================================================================
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+    Properties:
+      BucketName: !Sub '${StackPrefix}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ServerAccessLogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # -------------------------------------------------------------------------
+  # TLS-only bucket policies for the four data buckets (deny non-HTTPS access).
+  # -------------------------------------------------------------------------
+  SupportCasesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SupportCasesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt SupportCasesBucket.Arn
+              - !Sub '${SupportCasesBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  FraudPlaybooksBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FraudPlaybooksBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt FraudPlaybooksBucket.Arn
+              - !Sub '${FraudPlaybooksBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  SeedStagingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SeedStagingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt SeedStagingBucket.Arn
+              - !Sub '${SeedStagingBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  AgentBuildSourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AgentBuildSourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AgentBuildSourceBucket.Arn
+              - !Sub '${AgentBuildSourceBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # =========================================================================
+  # 1. COGNITO USER POOL - Gateway JWT Auth
+  # =========================================================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${StackPrefix}-lab-users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${StackPrefix}-lab-client'
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      GenerateSecret: false
+
+  # -----------------------------------------------------------------------
+  # Cognito Domain - required for OAuth2 token endpoint
+  # -----------------------------------------------------------------------
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${StackPrefix}-${AWS::AccountId}'
+      UserPoolId: !Ref CognitoUserPool
+
+  # -----------------------------------------------------------------------
+  # Resource Server - defines OAuth2 scopes the Gateway requires
+  # -----------------------------------------------------------------------
+  CognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: !Sub '${StackPrefix}-gateway'
+      Name: !Sub '${StackPrefix}-gateway-resource-server'
+      Scopes:
+        - ScopeName: invoke
+          ScopeDescription: Invoke access to the fraud investigation gateway
+
+  # -----------------------------------------------------------------------
+  # Machine Client - for agent to call Gateway (OAuth2 client_credentials)
+  # -----------------------------------------------------------------------
+  CognitoMachineClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoResourceServer
+    Properties:
+      ClientName: !Sub '${StackPrefix}-machine-client'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub '${StackPrefix}-gateway/invoke'
+      AllowedOAuthFlowsUserPoolClient: true
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # -----------------------------------------------------------------------
+  # Auto-generated workshop user password (stored in Secrets Manager)
+  # -----------------------------------------------------------------------
+  WorkshopUserPassword:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_USING_CMK
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+    Properties:
+      Name: !Sub '${StackPrefix}-${AWS::Region}-workshop-user-password'
+      Description: Auto-generated password for the workshop dashboard user
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludePunctuation: false
+        ExcludeCharacters: '"''\`/@:;,<>[]{}()%$#&*|'
+        RequireEachIncludedType: true
+
+  # -----------------------------------------------------------------------
+  # Lambda custom resource: Create Cognito user with generated password
+  # -----------------------------------------------------------------------
+  WorkshopUserCreatorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-user-creator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UserCreatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminDeleteUser
+                Resource: !GetAtt CognitoUserPool.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WorkshopUserPassword
+
+  WorkshopUserCreatorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-user-creator'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt WorkshopUserCreatorRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt FunctionDlq.Arn
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref CognitoUserPool
+          SECRET_ARN: !Ref WorkshopUserPassword
+          USERNAME: !Sub '${StackPrefix}-admin@workshop.aws'
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          import urllib3
+          http = urllib3.PoolManager()
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
+          def send_cfn(event, context, status, data=None):
+              body = json.dumps({
+                  "Status": status, "Reason": "See CloudWatch",
+                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {}
+              })
+              http.request("PUT", event["ResponseURL"], body=body,
+                          headers={"content-type": ""})
+          def handler(event, context):
+              user_pool_id = os.environ['USER_POOL_ID']
+              username = os.environ['USERNAME']
+              secret_arn = os.environ['SECRET_ARN']
+              cognito = boto3.client('cognito-idp')
+              sm = boto3.client('secretsmanager')
+
+              if event['RequestType'] == 'Delete':
+                  try:
+                      cognito.admin_delete_user(UserPoolId=user_pool_id, Username=username)
+                      print(f"Deleted user {username}")
+                  except Exception as e:
+                      print(f"Delete user failed (non-fatal): {e}")
+                  send_cfn(event, context, SUCCESS, {})
+                  return
+              try:
+                  # Get the auto-generated password
+                  password = sm.get_secret_value(SecretId=secret_arn)['SecretString']
+                  print(f"Retrieved password (length: {len(password)})")
+
+                  # Create user (idempotent - ignore if exists)
+                  try:
+                      cognito.admin_create_user(
+                          UserPoolId=user_pool_id,
+                          Username=username,
+                          TemporaryPassword='TempPass123!InitialOnly',
+                          UserAttributes=[
+                              {'Name': 'email', 'Value': username},
+                              {'Name': 'email_verified', 'Value': 'true'},
+                          ],
+                          MessageAction='SUPPRESS',
+                      )
+                      print(f"Created user {username}")
+                  except cognito.exceptions.UsernameExistsException:
+                      print(f"User {username} already exists, updating password")
+
+                  # Set permanent password from secret
+                  cognito.admin_set_user_password(
+                      UserPoolId=user_pool_id,
+                      Username=username,
+                      Password=password,
+                      Permanent=True,
+                  )
+                  print(f"Password set for {username}")
+
+                  send_cfn(event, context, SUCCESS, {"Username": username})
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  send_cfn(event, context, FAILED, {"Error": str(e)})
+
+  WorkshopUserCreatorTrigger:
+    Type: Custom::WorkshopUserCreator
+    DependsOn:
+      - CognitoUserPool
+      - WorkshopUserPassword
+      - WorkshopUserCreatorFunction
+    Properties:
+      ServiceToken: !GetAtt WorkshopUserCreatorFunction.Arn
+      Version: '1'
+
+
+  # =========================================================================
+  # 2. DYNAMODB TABLES - Transactions, Customer Profiles, Login Activity
+  # =========================================================================
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    DependsOn: SeedBootstrapTrigger
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackPrefix}-transactions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: transaction_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transaction_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt WorkshopKmsKey.Arn
+      ImportSourceSpecification:
+        InputFormat: DYNAMODB_JSON
+        S3BucketSource:
+          S3Bucket: !Ref SeedStagingBucket
+          S3KeyPrefix: seed-data/transactions/
+
+  CustomerProfilesTable:
+    Type: AWS::DynamoDB::Table
+    DependsOn: SeedBootstrapTrigger
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackPrefix}-customer-profiles'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt WorkshopKmsKey.Arn
+      ImportSourceSpecification:
+        InputFormat: DYNAMODB_JSON
+        S3BucketSource:
+          S3Bucket: !Ref SeedStagingBucket
+          S3KeyPrefix: seed-data/customer-profiles/
+
+  LoginActivityTable:
+    Type: AWS::DynamoDB::Table
+    DependsOn: SeedBootstrapTrigger
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackPrefix}-login-activity'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt WorkshopKmsKey.Arn
+      ImportSourceSpecification:
+        InputFormat: DYNAMODB_JSON
+        S3BucketSource:
+          S3Bucket: !Ref SeedStagingBucket
+          S3KeyPrefix: seed-data/login-activity/
+
+  # =========================================================================
+  # 4. S3 BUCKETS - Support Cases + Fraud Playbooks
+  # =========================================================================
+  SupportCasesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+    Properties:
+      BucketName: !Sub '${StackPrefix}-support-cases-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: support-cases/
+
+  FraudPlaybooksBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+    Properties:
+      BucketName: !Sub '${StackPrefix}-playbooks-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: playbooks/
+
+  # -----------------------------------------------------------------------
+  # Seed staging bucket (this account). The SeedBootstrap custom resource
+  # downloads the workshop seed bundle over HTTPS and writes the DynamoDB
+  # import data and the dashboard build here. Keeping the
+  # DynamoDB import source in-account avoids any cross-account S3 access and
+  # removes the need for the attendee to pre-stage data or run the CLI.
+  # -----------------------------------------------------------------------
+  SeedStagingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+    Properties:
+      BucketName: !Sub '${StackPrefix}-seed-staging-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: seed-staging/
+
+  # =========================================================================
+  # 5. SEED BOOTSTRAP - Download seed bundle over HTTPS, populate buckets
+  #   Turnkey self-serve: no pre-staged private bucket, no manual copy step.
+  #   Reads s3://{AssetsBucketName}/{AssetsObjectKey} via the S3 API (IAM role,
+  #   no public access) and routes each file:
+  #     seed-data/transactions|customer-profiles|login-activity/  -> SeedStagingBucket (DynamoDB import)
+  #     seed-data/playbooks/*                                     -> FraudPlaybooksBucket/playbooks/ (KB source)
+  #     seed-data/support-cases/cases/*                           -> SupportCasesBucket/cases/ (support API)
+  #     dashboard/build.zip, fraud-agent-lab.ipynb               -> SeedStagingBucket
+  # =========================================================================
+  SeedBootstrapRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-seed-bootstrap-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SeedBootstrapPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${SeedStagingBucket.Arn}/*'
+                  - !Sub '${FraudPlaybooksBucket.Arn}/*'
+                  - !Sub '${SupportCasesBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucketName}'
+
+  SeedBootstrapFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-seed-bootstrap'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt SeedBootstrapRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt FunctionDlq.Arn
+      Environment:
+        Variables:
+          ASSETS_BUCKET: !Ref AssetsBucketName
+          ASSETS_KEY: !Ref AssetsObjectKey
+          STAGING_BUCKET: !Ref SeedStagingBucket
+          PLAYBOOKS_BUCKET: !Ref FraudPlaybooksBucket
+          SUPPORT_BUCKET: !Ref SupportCasesBucket
+      Code:
+        ZipFile: |
+          import os, io, json, zipfile, boto3, urllib3
+          http = urllib3.PoolManager()
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
+          def send_cfn(event, context, status, data=None):
+              # Surface the real error in the CloudFormation event message so a
+              # failure is self-describing in the console (no CloudWatch dig).
+              reason = (data or {}).get("Error") or "See CloudWatch logs"
+              body = json.dumps({
+                  "Status": status, "Reason": str(reason)[:1000],
+                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {}
+              })
+              http.request("PUT", event["ResponseURL"], body=body,
+                          headers={"content-type": ""})
+          def handler(event, context):
+              if event["RequestType"] == "Delete":
+                  send_cfn(event, context, SUCCESS, {})
+                  return
+              try:
+                  src_bucket = os.environ["ASSETS_BUCKET"]
+                  src_key = os.environ["ASSETS_KEY"]
+                  staging = os.environ["STAGING_BUCKET"]
+                  playbooks = os.environ["PLAYBOOKS_BUCKET"]
+                  support = os.environ["SUPPORT_BUCKET"]
+                  # Destination buckets are in this stack's region: use the default client.
+                  s3 = boto3.client("s3")
+                  # The assets bucket is the event's regional bucket, in the same
+                  # region as this stack, so the default client reads it directly.
+                  # Avoid a cross-region GetBucketLocation call: the Workshop Studio
+                  # bucket policy denies requests made from another region.
+                  print(f"Reading s3://{src_bucket}/{src_key}")
+                  bundle = s3.get_object(Bucket=src_bucket, Key=src_key)["Body"].read()
+                  print(f"Bundle size: {len(bundle)} bytes")
+                  count = 0
+                  with zipfile.ZipFile(io.BytesIO(bundle)) as zf:
+                      for name in zf.namelist():
+                          if name.endswith("/"):
+                              continue
+                          data = zf.read(name)
+                          leaf = name.split("/")[-1]
+                          if name.startswith("seed-data/playbooks/"):
+                              dest_b, dest_k = playbooks, "playbooks/" + leaf
+                          elif name.startswith("seed-data/support-cases/cases/"):
+                              dest_b, dest_k = support, "cases/" + leaf
+                          elif name.startswith("seed-data/"):
+                              dest_b, dest_k = staging, name
+                          elif name == "dashboard/build.zip":
+                              dest_b, dest_k = staging, name
+                          elif name == "fraud-agent-lab.ipynb":
+                              dest_b, dest_k = staging, name
+                          else:
+                              continue
+                          s3.put_object(Bucket=dest_b, Key=dest_k, Body=data)
+                          count += 1
+                  print(f"Wrote {count} objects")
+                  send_cfn(event, context, SUCCESS, {"ObjectsWritten": count})
+              except Exception as e:
+                  import traceback
+                  traceback.print_exc()
+                  send_cfn(event, context, FAILED, {"Error": str(e)})
+
+  SeedBootstrapTrigger:
+    Type: Custom::SeedBootstrap
+    DependsOn:
+      - SeedStagingBucket
+      - FraudPlaybooksBucket
+      - SupportCasesBucket
+    Properties:
+      ServiceToken: !GetAtt SeedBootstrapFunction.Arn
+      Version: '2'
+
+  # =========================================================================
+  # 5b. BUCKET CLEANUP - Empty all stack buckets on delete
+  #   Makes teardown reliable. Versioned buckets (playbooks, support cases) and
+  #   object-filled buckets (staging, build source) are emptied automatically
+  #   on Delete, so DELETE_COMPLETE never stalls on a non-empty bucket. Because
+  #   this resource DependsOn the buckets, CloudFormation deletes it (and runs
+  #   its emptying logic) before it deletes the buckets themselves. Cleanup
+  #   always reports SUCCESS on Delete so a cleanup hiccup never blocks teardown.
+  # =========================================================================
+  BucketCleanupRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-bucket-cleanup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BucketCleanupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:GetBucketVersioning
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource:
+                  - !GetAtt SeedStagingBucket.Arn
+                  - !Sub '${SeedStagingBucket.Arn}/*'
+                  - !GetAtt FraudPlaybooksBucket.Arn
+                  - !Sub '${FraudPlaybooksBucket.Arn}/*'
+                  - !GetAtt SupportCasesBucket.Arn
+                  - !Sub '${SupportCasesBucket.Arn}/*'
+                  - !GetAtt AgentBuildSourceBucket.Arn
+                  - !Sub '${AgentBuildSourceBucket.Arn}/*'
+
+  BucketCleanupFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-bucket-cleanup'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt BucketCleanupRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt FunctionDlq.Arn
+      Code:
+        ZipFile: |
+          import json, boto3, urllib3
+          http = urllib3.PoolManager()
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
+          def send_cfn(event, context, status, data=None):
+              reason = (data or {}).get("Error") or "OK"
+              body = json.dumps({
+                  "Status": status, "Reason": str(reason)[:1000],
+                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {}
+              })
+              http.request("PUT", event["ResponseURL"], body=body,
+                          headers={"content-type": ""})
+          def empty_bucket(s3, bucket):
+              # Delete all versions and delete markers (handles versioned buckets)
+              vpag = s3.get_paginator("list_object_versions")
+              for page in vpag.paginate(Bucket=bucket):
+                  objs = [{"Key": v["Key"], "VersionId": v["VersionId"]}
+                          for v in page.get("Versions", []) + page.get("DeleteMarkers", [])]
+                  if objs:
+                      s3.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+              # Fallback for any current objects on non-versioned buckets
+              opag = s3.get_paginator("list_objects_v2")
+              for page in opag.paginate(Bucket=bucket):
+                  objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                  if objs:
+                      s3.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+          def handler(event, context):
+              if event["RequestType"] != "Delete":
+                  send_cfn(event, context, SUCCESS, {})
+                  return
+              s3 = boto3.client("s3")
+              for b in event.get("ResourceProperties", {}).get("Buckets", []):
+                  try:
+                      empty_bucket(s3, b)
+                      print(f"Emptied {b}")
+                  except Exception as e:
+                      # Never block teardown on a cleanup error
+                      print(f"Skip {b}: {e}")
+              send_cfn(event, context, SUCCESS, {})
+
+  BucketCleanupTrigger:
+    Type: Custom::BucketCleanup
+    DependsOn:
+      - SeedStagingBucket
+      - FraudPlaybooksBucket
+      - SupportCasesBucket
+      - AgentBuildSourceBucket
+    Properties:
+      ServiceToken: !GetAtt BucketCleanupFunction.Arn
+      Version: '1'
+      Buckets:
+        - !Ref SeedStagingBucket
+        - !Ref FraudPlaybooksBucket
+        - !Ref SupportCasesBucket
+        - !Ref AgentBuildSourceBucket
+
+  # =========================================================================
+  # 6 + 7. BEDROCK MANAGED KNOWLEDGE BASE - Fraud Playbooks
+  #   Managed KB: Amazon Bedrock provisions and manages the vector store.
+  #   No AWS::S3Vectors::VectorBucket or ::Index to declare here, and no
+  #   StorageConfiguration block (compare to the VECTOR + S3 Vectors variant).
+  # =========================================================================
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-kb-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: BedrockKBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EmbeddingModelAccess
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+              - Sid: S3DataSourceAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FraudPlaybooksBucket.Arn
+                  - !Sub '${FraudPlaybooksBucket.Arn}/*'
+              # S3VectorsAccess removed: Managed KB manages the vector store,
+              # so the KB role no longer needs s3vectors:* permissions.
+
+  FraudKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub '${StackPrefix}-playbooks-kb'
+      Description: Fraud detection playbooks and response procedures for the investigation agent
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: MANAGED
+        ManagedKnowledgeBaseConfiguration:
+          # For a MANAGED knowledge base, EmbeddingModelArn is still required by
+          # the CFN schema. EmbeddingModelType CUSTOM reuses the Titan embedding
+          # model referenced by the EmbeddingModelId parameter.
+          EmbeddingModelArn: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+          EmbeddingModelType: CUSTOM
+      # No StorageConfiguration: Amazon Bedrock manages the vector store for a MANAGED KB.
+
+  FraudKBDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref FraudKnowledgeBase
+      Name: !Sub '${StackPrefix}-playbooks-source'
+      Description: S3 bucket containing fraud playbook documents
+      # Managed KB does NOT accept Type: S3. It requires the new
+      # MANAGED_KNOWLEDGE_BASE_CONNECTOR type. ConnectorParameters is a
+      # pass-through JSON document, so the keys inside it are camelCase
+      # (type, version, connectionConfiguration) unlike the PascalCase CFN
+      # keys around it.
+      DataSourceConfiguration:
+        Type: MANAGED_KNOWLEDGE_BASE_CONNECTOR
+        ManagedKnowledgeBaseConnectorConfiguration:
+          ConnectorParameters:
+            type: S3
+            version: "1"
+            connectionConfiguration:
+              bucketName: !Ref FraudPlaybooksBucket
+              bucketOwnerAccountId: !Ref AWS::AccountId
+            filterConfiguration:
+              inclusionPrefixes:
+                - 'playbooks/'
+
+
+  # =========================================================================
+  # 8. API GATEWAY - DynamoDB Direct Integration (4 tools)
+  # =========================================================================
+  ApiGatewayDynamoDBRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-apigw-dynamodb-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt TransactionsTable.Arn
+                  - !GetAtt CustomerProfilesTable.Arn
+                  - !GetAtt LoginActivityTable.Arn
+              # The tables are encrypted with the workshop customer-managed key,
+              # so the API Gateway integration role needs to use that key to
+              # read (Decrypt) and write (GenerateDataKey) item data.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt WorkshopKmsKey.Arn
+
+  InvestigationApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${StackPrefix}-investigation-api'
+      Description: DynamoDB direct integration for fraud investigation tools
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # --- /transactions/{transaction_id} GET ---
+  TransactionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ParentId: !GetAtt InvestigationApi.RootResourceId
+      PathPart: transactions
+
+  TransactionIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ParentId: !Ref TransactionsResource
+      PathPart: '{transaction_id}'
+
+  GetTransactionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ResourceId: !Ref TransactionIdResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      OperationName: get_transaction_details
+      RequestParameters:
+        method.request.path.transaction_id: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/GetItem'
+        Credentials: !GetAtt ApiGatewayDynamoDBRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${TransactionsTable}",
+              "Key": {
+                "transaction_id": {"S": "$input.params('transaction_id')"}
+              }
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: |
+                #set($item = $input.path('$.Item'))
+                #if($item && $item != "")
+                {
+                  "transaction_id": "$item.transaction_id.S",
+                  "customer_id": "$item.customer_id.S",
+                  "amount": "$item.amount.S",
+                  "avg_order_value": "$item.avg_order_value.S",
+                  "timestamp": "$item.timestamp.S",
+                  "device": "$item.device.S",
+                  "shipping_city": "$item.shipping_city.S",
+                  "shipping_state": "$item.shipping_state.S",
+                  "category": "$item.category.S",
+                  "payment_method": "$item.payment_method.S",
+                  "device_fingerprint": "$item.device_fingerprint.S",
+                  "status": "$item.status.S"
+                }
+                #else
+                {"error": "Transaction not found"}
+                #end
+      MethodResponses:
+        - StatusCode: '200'
+
+  # --- /transactions/{transaction_id}/hold POST ---
+  HoldResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ParentId: !Ref TransactionIdResource
+      PathPart: hold
+
+  HoldTransactionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ResourceId: !Ref HoldResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      OperationName: hold_transaction
+      RequestParameters:
+        method.request.path.transaction_id: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/UpdateItem'
+        Credentials: !GetAtt ApiGatewayDynamoDBRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${TransactionsTable}",
+              "Key": {
+                "transaction_id": {"S": "$input.params('transaction_id')"}
+              },
+              "UpdateExpression": "SET #s = :held",
+              "ExpressionAttributeNames": {"#s": "status"},
+              "ExpressionAttributeValues": {":held": {"S": "held"}},
+              "ReturnValues": "ALL_NEW"
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: |
+                #set($item = $input.path('$.Attributes'))
+                {
+                  "transaction_id": "$item.transaction_id.S",
+                  "status": "$item.status.S",
+                  "message": "Transaction held successfully"
+                }
+      MethodResponses:
+        - StatusCode: '200'
+
+  # --- /customers/{customer_id} GET ---
+  CustomersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ParentId: !GetAtt InvestigationApi.RootResourceId
+      PathPart: customers
+
+  CustomerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ParentId: !Ref CustomersResource
+      PathPart: '{customer_id}'
+
+  GetCustomerProfileMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ResourceId: !Ref CustomerIdResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      OperationName: get_customer_profile
+      RequestParameters:
+        method.request.path.customer_id: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/GetItem'
+        Credentials: !GetAtt ApiGatewayDynamoDBRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${CustomerProfilesTable}",
+              "Key": {
+                "customer_id": {"S": "$input.params('customer_id')"}
+              }
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: |
+                #set($item = $input.path('$.Item'))
+                #if($item && $item != "")
+                {
+                  "customer_id": "$item.customer_id.S",
+                  "name": "$item.name.S",
+                  "email": "$item.email.S",
+                  "member_since": "$item.member_since.S",
+                  "avg_order_value": "$item.avg_order_value.S",
+                  "typical_shipping_city": "$item.typical_shipping_city.S",
+                  "typical_shipping_state": "$item.typical_shipping_state.S",
+                  "normal_hours_start": "$item.normal_hours_start.S",
+                  "normal_hours_end": "$item.normal_hours_end.S",
+                  "total_orders": "$item.total_orders.S",
+                  "account_status": "$item.account_status.S"
+                }
+                #else
+                {"error": "Customer not found"}
+                #end
+      MethodResponses:
+        - StatusCode: '200'
+
+  # --- /logins/{customer_id} GET ---
+  LoginsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ParentId: !GetAtt InvestigationApi.RootResourceId
+      PathPart: logins
+
+  LoginCustomerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ParentId: !Ref LoginsResource
+      PathPart: '{customer_id}'
+
+  GetLoginActivityMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      ResourceId: !Ref LoginCustomerIdResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      OperationName: get_login_activity
+      RequestParameters:
+        method.request.path.customer_id: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/GetItem'
+        Credentials: !GetAtt ApiGatewayDynamoDBRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${LoginActivityTable}",
+              "Key": {
+                "customer_id": {"S": "$input.params('customer_id')"}
+              }
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: |
+                #set($item = $input.path('$.Item'))
+                #if($item && $item != "")
+                {
+                  "customer_id": "$item.customer_id.S",
+                  "events": $item.events.S
+                }
+                #else
+                {"error": "Login activity not found"}
+                #end
+      MethodResponses:
+        - StatusCode: '200'
+
+  # --- Deploy Investigation API ---
+  InvestigationApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetTransactionMethod
+      - HoldTransactionMethod
+      - GetCustomerProfileMethod
+      - GetLoginActivityMethod
+    Properties:
+      RestApiId: !Ref InvestigationApi
+
+  InvestigationApiStage:
+    Type: AWS::ApiGateway::Stage
+    Metadata:
+      guard:
+        SuppressedRules:
+          - API_GW_ACCESS_LOGGING_ENABLED
+    Properties:
+      RestApiId: !Ref InvestigationApi
+      DeploymentId: !Ref InvestigationApiDeployment
+      StageName: prod
+      Description: Production stage for investigation API
+      TracingEnabled: true
+
+
+  # =========================================================================
+  # 9. API GATEWAY - S3 Direct Integration (1 tool: get_support_cases)
+  # =========================================================================
+  ApiGatewayS3Role:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-apigw-s3-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub '${SupportCasesBucket.Arn}/*'
+
+  SupportApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${StackPrefix}-support-api'
+      Description: S3 direct integration for customer support case history
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # --- /support-cases/{customer_id} GET ---
+  SupportCasesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SupportApi
+      ParentId: !GetAtt SupportApi.RootResourceId
+      PathPart: support-cases
+
+  SupportCustomerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SupportApi
+      ParentId: !Ref SupportCasesResource
+      PathPart: '{customer_id}'
+
+  GetSupportCasesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SupportApi
+      ResourceId: !Ref SupportCustomerIdResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      OperationName: get_support_cases
+      RequestParameters:
+        method.request.path.customer_id: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:s3:path/${SupportCasesBucket}/cases/{customer_id}.json'
+        Credentials: !GetAtt ApiGatewayS3Role.Arn
+        RequestParameters:
+          integration.request.path.customer_id: method.request.path.customer_id
+        IntegrationResponses:
+          - StatusCode: '200'
+          - StatusCode: '404'
+            SelectionPattern: '404'
+            ResponseTemplates:
+              application/json: '{"cases": [], "message": "No support cases found"}'
+      MethodResponses:
+        - StatusCode: '200'
+        - StatusCode: '404'
+
+  # --- Deploy Support API ---
+  SupportApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetSupportCasesMethod
+    Properties:
+      RestApiId: !Ref SupportApi
+
+  SupportApiStage:
+    Type: AWS::ApiGateway::Stage
+    Metadata:
+      guard:
+        SuppressedRules:
+          - API_GW_ACCESS_LOGGING_ENABLED
+    Properties:
+      RestApiId: !Ref SupportApi
+      DeploymentId: !Ref SupportApiDeployment
+      StageName: prod
+      Description: Production stage for support API
+      TracingEnabled: true
+
+
+  # =========================================================================
+  # 10. AGENTCORE GATEWAY + 3 MCP TARGETS
+  # =========================================================================
+  AgentCoreGatewayRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-agentcore-gw-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: GatewayApiAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${InvestigationApi}/prod/*'
+                  - !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${SupportApi}/prod/*'
+              # KB-as-Gateway-target: the Gateway IAM role invokes the Managed KB
+              # connector, so it needs Retrieve + GetKnowledgeBase on the KB.
+              - Effect: Allow
+                Action:
+                  - bedrock:GetKnowledgeBase
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: !GetAtt FraudKnowledgeBase.KnowledgeBaseArn
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*'
+
+  FraudGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    DependsOn:
+      - InvestigationApiStage
+      - SupportApiStage
+    Properties:
+      Name: !Sub '${StackPrefix}-investigation-gw'
+      Description: MCP Gateway for fraud investigation tools
+      ProtocolType: MCP
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          AllowedClients:
+            - !Ref CognitoMachineClient
+          DiscoveryUrl: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/openid-configuration'
+      RoleArn: !GetAtt AgentCoreGatewayRole.Arn
+      Tags:
+        Workshop: mcp-fraud-lab
+
+  # --- Target 1: Investigation Data (DynamoDB via API Gateway) ---
+  InvestigationTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: FraudGateway
+    Properties:
+      GatewayIdentifier: !GetAtt FraudGateway.GatewayIdentifier
+      Name: investigation-data
+      Description: Transaction data, customer profiles, login activity, and transaction holds via DynamoDB
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          ApiGateway:
+            RestApiId: !Ref InvestigationApi
+            Stage: prod
+            ApiGatewayToolConfiguration:
+              ToolFilters:
+                - FilterPath: '/*'
+                  Methods:
+                    - GET
+                    - POST
+              ToolOverrides:
+                - Name: get_transaction_details
+                  Description: Retrieves full transaction info including amount, device, IP, shipping address
+                  Path: /transactions/{transaction_id}
+                  Method: GET
+                - Name: hold_transaction
+                  Description: Places a hold on a suspicious transaction
+                  Path: /transactions/{transaction_id}/hold
+                  Method: POST
+                - Name: get_customer_profile
+                  Description: Retrieves customer history, purchase patterns, account age
+                  Path: /customers/{customer_id}
+                  Method: GET
+                - Name: get_login_activity
+                  Description: Retrieves recent login events, devices, IPs, password changes
+                  Path: /logins/{customer_id}
+                  Method: GET
+
+  # --- Target 2: Customer Support History (S3 via API Gateway) ---
+  SupportTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: FraudGateway
+    Properties:
+      GatewayIdentifier: !GetAtt FraudGateway.GatewayIdentifier
+      Name: customer-support-history
+      Description: Customer support case history and dispute records from S3
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          ApiGateway:
+            RestApiId: !Ref SupportApi
+            Stage: prod
+            ApiGatewayToolConfiguration:
+              ToolFilters:
+                - FilterPath: '/*'
+                  Methods:
+                    - GET
+              ToolOverrides:
+                - Name: get_support_cases
+                  Description: Retrieves past support cases, dispute history, and previous fraud reports for a customer
+                  Path: /support-cases/{customer_id}
+                  Method: GET
+
+  # --- Target 3: Fraud Playbooks (Managed KB via bedrock-knowledge-bases connector) ---
+  # Replaces the agent's old built-in retrieve() tool. The Managed KB is exposed
+  # as a native MCP target, so the agent discovers it through the Gateway exactly
+  # like the DynamoDB and S3 tools (zero hardcoded integrations).
+  FraudPlaybookTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn:
+      - FraudGateway
+      - FraudKnowledgeBase
+    Properties:
+      GatewayIdentifier: !GetAtt FraudGateway.GatewayIdentifier
+      Name: fraud-playbooks
+      Description: Fraud detection playbooks and response procedures via Bedrock Managed Knowledge Base
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Connector:
+            Source:
+              ConnectorId: bedrock-knowledge-bases
+            Configurations:
+              - Name: Retrieve
+                ParameterValues:
+                  knowledgeBaseId: !Ref FraudKnowledgeBase
+
+
+  # =========================================================================
+  # 12. AMPLIFY APP - Fraud Alert Dashboard
+  # =========================================================================
+  AmplifyServiceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-amplify-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: amplify.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AmplifyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - amplify:GetApp
+                  - amplify:UpdateApp
+                  - amplify:GetBranch
+                  - amplify:CreateBranch
+                  - amplify:UpdateBranch
+                  - amplify:CreateDeployment
+                  - amplify:StartDeployment
+                  - amplify:StartJob
+                  - amplify:GetJob
+                  - amplify:ListJobs
+                  - amplify:TagResource
+                Resource: !Sub 'arn:${AWS::Partition}:amplify:${AWS::Region}:${AWS::AccountId}:apps/*'
+
+  FraudDashboardApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub '${StackPrefix}-alert-dashboard'
+      Description: Fraud Alert Dashboard for the MCP workshop
+      IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
+      EnvironmentVariables:
+        - Name: REACT_APP_INVESTIGATION_API
+          Value: !Sub 'https://${InvestigationApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+        - Name: REACT_APP_SUPPORT_API
+          Value: !Sub 'https://${SupportApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+        - Name: REACT_APP_COGNITO_USER_POOL_ID
+          Value: !Ref CognitoUserPool
+        - Name: REACT_APP_COGNITO_CLIENT_ID
+          Value: !Ref CognitoUserPoolClient
+        - Name: REACT_APP_AGENT_RUNTIME_ARN
+          Value: !GetAtt FraudInvestigationRuntime.AgentRuntimeArn
+      Tags:
+        - Key: Workshop
+          Value: mcp-fraud-lab
+
+  FraudDashboardBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt FraudDashboardApp.AppId
+      BranchName: main
+      Description: Main branch for the Fraud Alert Dashboard
+      EnableAutoBuild: false
+
+  # =========================================================================
+  # 13. KB SYNC CUSTOM RESOURCE - Trigger initial KB data source sync
+  # =========================================================================
+  KBSyncRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-kb-sync-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockKBSync
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:StartIngestionJob
+                  - bedrock:GetIngestionJob
+                Resource:
+                  - !GetAtt FraudKnowledgeBase.KnowledgeBaseArn
+
+  KBSyncFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-kb-sync'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt KBSyncRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt FunctionDlq.Arn
+      Environment:
+        Variables:
+          KB_ID: !Ref FraudKnowledgeBase
+          DS_ID: !GetAtt FraudKBDataSource.DataSourceId
+      Code:
+        ZipFile: |
+          import os, time, boto3, json
+          import urllib3
+          http = urllib3.PoolManager()
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
+          def send_cfn(event, context, status, data={}):
+              body = json.dumps({"Status": status, "Reason": "See CloudWatch", "PhysicalResourceId": context.log_stream_name, "StackId": event["StackId"], "RequestId": event["RequestId"], "LogicalResourceId": event["LogicalResourceId"], "Data": data})
+              http.request("PUT", event["ResponseURL"], body=body, headers={"content-type": ""})
+          bedrock = boto3.client('bedrock-agent')
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send_cfn(event, context, SUCCESS, {})
+                  return
+              try:
+                  kb_id = os.environ['KB_ID']
+                  ds_id = os.environ['DS_ID']
+                  resp = bedrock.start_ingestion_job(
+                      knowledgeBaseId=kb_id,
+                      dataSourceId=ds_id
+                  )
+                  job_id = resp['ingestionJob']['ingestionJobId']
+                  # Poll for completion (max 4 min)
+                  for _ in range(24):
+                      time.sleep(10)
+                      status = bedrock.get_ingestion_job(
+                          knowledgeBaseId=kb_id,
+                          dataSourceId=ds_id,
+                          ingestionJobId=job_id
+                      )['ingestionJob']['status']
+                      if status == 'COMPLETE':
+                          send_cfn(event, context, SUCCESS, {"JobId": job_id})
+                          return
+                      elif status == 'FAILED':
+                          send_cfn(event, context, FAILED, {"Error": "Ingestion failed"})
+                          return
+                  send_cfn(event, context, SUCCESS, {"JobId": job_id, "Note": "Sync still in progress"})
+              except Exception as e:
+                  send_cfn(event, context, FAILED, {"Error": str(e)})
+
+  KBSyncTrigger:
+    Type: Custom::KBSync
+    DependsOn:
+      - FraudKBDataSource
+      - FraudPlaybooksBucket
+      - SeedBootstrapTrigger
+    Properties:
+      ServiceToken: !GetAtt KBSyncFunction.Arn
+
+
+  # =========================================================================
+  # 14. ECR REPOSITORY - Hosts the agent Docker image
+  # =========================================================================
+  AgentEcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${StackPrefix}-agent'
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt WorkshopKmsKey.Arn
+
+  # =========================================================================
+  # 15. CODEBUILD PROJECT - Builds the agent Docker image and pushes to ECR
+  # =========================================================================
+  AgentBuildSourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+    Properties:
+      BucketName: !Sub '${StackPrefix}-agent-build-src-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: agent-build-src/
+
+  AgentBuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-agent-build-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AgentBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AgentBuildSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt AgentEcrRepo.Arn
+              # CodeBuild uses the workshop customer-managed key to encrypt the
+              # build environment, so its service role needs key usage.
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncryptFrom
+                  - kms:ReEncryptTo
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt WorkshopKmsKey.Arn
+
+  AgentBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackPrefix}-agent-build'
+      ServiceRole: !GetAtt AgentBuildRole.Arn
+      EncryptionKey: !GetAtt WorkshopKmsKey.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_REPO_URI
+            Value: !GetAtt AgentEcrRepo.RepositoryUri
+          - Name: IMAGE_TAG
+            Value: latest
+      Source:
+        Type: S3
+        Location: !Sub '${AgentBuildSourceBucket}/source.zip'
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+            build:
+              commands:
+                - echo Building the Docker image for ARM64...
+                - docker build -t $ECR_REPO_URI:$IMAGE_TAG .
+            post_build:
+              commands:
+                - echo Pushing the Docker image...
+                - docker push $ECR_REPO_URI:$IMAGE_TAG
+                - echo Build complete
+      TimeoutInMinutes: 20
+
+
+  # =========================================================================
+  # 16. LAMBDA CUSTOM RESOURCE - Zip agent source, upload, trigger CodeBuild
+  # =========================================================================
+  AgentSourceUploaderRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-agent-src-uploader-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AgentSourceUploaderPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AgentBuildSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt AgentBuildProject.Arn
+
+  AgentSourceUploaderFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-agent-src-uploader'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt AgentSourceUploaderRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt FunctionDlq.Arn
+      Environment:
+        Variables:
+          BUILD_BUCKET: !Ref AgentBuildSourceBucket
+          BUILD_PROJECT: !Ref AgentBuildProject
+      Code:
+        ZipFile: |
+          import json, os, io, zipfile, time, boto3
+          import urllib3
+          http = urllib3.PoolManager()
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
+          def send_cfn(event, context, status, data=None):
+              body = json.dumps({
+                  "Status": status, "Reason": "See CloudWatch",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {}
+              })
+              http.request("PUT", event["ResponseURL"], body=body,
+                          headers={"content-type": ""})
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send_cfn(event, context, SUCCESS)
+                  return
+              try:
+                  bucket = os.environ['BUILD_BUCKET']
+                  project = os.environ['BUILD_PROJECT']
+                  # ------------------------------------------
+                  # Agent source code (Dockerfile + agent.py + reqs)
+                  # ------------------------------------------
+                  dockerfile = (
+                      "FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim\n"
+                      "ENV PYTHONUNBUFFERED=1\n"
+                      "WORKDIR /app\n"
+                      "COPY requirements.txt .\n"
+                      "RUN pip install --no-cache-dir -r requirements.txt\n"
+                      "RUN useradd -m -u 1000 bedrock_agentcore\n"
+                      "COPY agent.py .\n"
+                      "RUN chown -R bedrock_agentcore:bedrock_agentcore /app\n"
+                      "USER bedrock_agentcore\n"
+                      "EXPOSE 8080\n"
+                      'CMD ["python", "agent.py"]\n'
+                  )
+                  requirements = (
+                      "bedrock-agentcore==1.0.6\n"
+                      "strands-agents==1.20.0\n"
+                      "strands-agents-tools==0.2.15\n"
+                      "boto3>=1.40.75\n"
+                      "botocore>=1.40.75\n"
+                      "mcp>=1.0.0\n"
+                      "requests>=2.31.0\n"
+                  )
+                  agent_py = event['ResourceProperties']['AgentCode']
+
+                  buf = io.BytesIO()
+                  with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                      zf.writestr('Dockerfile', dockerfile)
+                      zf.writestr('requirements.txt', requirements)
+                      zf.writestr('agent.py', agent_py)
+                  buf.seek(0)
+
+                  s3 = boto3.client('s3')
+                  s3.put_object(Bucket=bucket, Key='source.zip',
+                                Body=buf.getvalue())
+                  print(f"Uploaded source.zip to s3://{bucket}/source.zip")
+
+                  # Trigger CodeBuild
+                  cb = boto3.client('codebuild')
+                  start = cb.start_build(projectName=project)
+                  build_id = start['build']['id']
+                  print(f"Started build: {build_id}")
+
+                  # Wait for build to complete (max 14 minutes)
+                  for _ in range(84):  # 84 * 10s = 14 min
+                      time.sleep(10)
+                      resp = cb.batch_get_builds(ids=[build_id])
+                      build = resp['builds'][0]
+                      status = build['buildStatus']
+                      print(f"Build status: {status}")
+                      if status == 'SUCCEEDED':
+                          send_cfn(event, context, SUCCESS,
+                                   {"BuildId": build_id})
+                          return
+                      if status in ('FAILED', 'FAULT', 'TIMED_OUT',
+                                    'STOPPED'):
+                          send_cfn(event, context, FAILED,
+                                   {"Error": f"Build {status}",
+                                    "BuildId": build_id})
+                          return
+                  send_cfn(event, context, FAILED,
+                           {"Error": "Build timeout",
+                            "BuildId": build_id})
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  send_cfn(event, context, FAILED, {"Error": str(e)})
+
+  AgentSourceUploaderTrigger:
+    Type: Custom::AgentSourceUploader
+    DependsOn:
+      - AgentBuildSourceBucket
+      - AgentBuildProject
+      - AgentEcrRepo
+    Properties:
+      ServiceToken: !GetAtt AgentSourceUploaderFunction.Arn
+      Version: '7'
+      AgentCode: |
+        import os, json, boto3, requests, traceback
+        from strands import Agent, tool
+        from strands.models.bedrock import BedrockModel
+        from strands.tools.mcp import MCPClient
+        from mcp.client.streamable_http import streamablehttp_client
+        from bedrock_agentcore.runtime import BedrockAgentCoreApp
+
+        print("[AGENT] Starting fraud investigation agent", flush=True)
+
+        PREFERRED_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID",
+            "us.anthropic.claude-sonnet-4-6")
+        GATEWAY_URL = os.environ.get("GATEWAY_URL", "")
+        KNOWLEDGE_BASE_ID = os.environ.get("KNOWLEDGE_BASE_ID", "")
+        AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
+
+        def _resolve_model_id(preferred, region):
+            # Prefer the configured model. If it is not an ACTIVE inference
+            # profile (deprecated or unavailable), fall back to the newest
+            # available Claude so the workshop keeps working as models change.
+            try:
+                b = boto3.client("bedrock", region_name=region)
+                ids = [p["inferenceProfileId"]
+                       for p in b.list_inference_profiles(
+                           maxResults=1000).get("inferenceProfileSummaries", [])
+                       if p.get("status") == "ACTIVE"]
+                if preferred in ids:
+                    return preferred
+                claude = sorted([i for i in ids if "anthropic.claude" in i],
+                                reverse=True)
+                sonnet = [i for i in claude if "sonnet" in i]
+                chosen = (sonnet or claude or [preferred])[0]
+                print(f"[AGENT] Model {preferred} unavailable; using {chosen}",
+                      flush=True)
+                return chosen
+            except Exception as e:
+                print(f"[AGENT] Model resolve failed ({e}); using {preferred}",
+                      flush=True)
+                return preferred
+
+        BEDROCK_MODEL_ID = _resolve_model_id(PREFERRED_MODEL_ID, AWS_REGION)
+        COGNITO_DOMAIN = os.environ.get("COGNITO_DOMAIN", "")
+        COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
+        COGNITO_CLIENT_SECRET = os.environ.get("COGNITO_CLIENT_SECRET", "")
+        COGNITO_SCOPE = os.environ.get("COGNITO_SCOPE", "")
+
+        # bedrock_agent_runtime client removed: the fraud playbook KB is now an
+        # MCP tool on the AgentCore Gateway, so the agent no longer calls
+        # bedrock-agent-runtime.retrieve() directly.
+
+        def get_gateway_token():
+            r = requests.post(
+                f"https://{COGNITO_DOMAIN}/oauth2/token",
+                data={"grant_type": "client_credentials",
+                      "client_id": COGNITO_CLIENT_ID,
+                      "client_secret": COGNITO_CLIENT_SECRET,
+                      "scope": COGNITO_SCOPE},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30)
+            r.raise_for_status()
+            return r.json()["access_token"]
+
+        # search_fraud_playbooks built-in tool removed. The fraud playbook
+        # Knowledge Base is now discovered and invoked through the AgentCore
+        # Gateway (fraud-playbooks target), the same way as the other MCP tools.
+
+        SYSTEM_PROMPT = """You are an AI Fraud Investigation Agent for ShopSmart, an e-commerce company.
+
+        Your role is to investigate flagged transactions by:
+        1. Gathering transaction details, customer profiles, and login activity using MCP tools
+        2. Checking customer support case history for prior fraud incidents
+        3. Consulting fraud playbooks via the Knowledge Base for response procedures
+        4. Correlating all signals to determine fraud confidence level
+        5. Taking protective action (holding transactions) when warranted
+
+        ## Investigation Process
+
+        - Always start by getting the transaction details
+        - Then gather customer profile and login activity
+        - Check support case history for prior incidents
+        - Consult fraud playbooks with your findings
+        - Identify all anomaly signals and classify the threat
+        - Take action based on playbook recommendations
+
+        ## Show Your Reasoning (IMPORTANT)
+
+        This investigation is observed live by analysts learning how the agent thinks.
+        You MUST narrate your reasoning so they can follow along:
+
+        1. Before each tool call, write a single line in this exact format:
+           `> Calling \\`<tool_name>\\` to <verb> <object> because <reason>.`
+           Example:
+           `> Calling \\`get_login_activity\\` to retrieve recent logins for CUST-2847 because the transaction came from an unknown device at 2:47 AM.`
+
+        2. After each tool result, write a single line in this exact format:
+           `> Learned: <one-sentence insight>. <Optional next step>.`
+           Example:
+           `> Learned: Password was changed from a VPN IP 2 hours before the transaction - strong account-takeover signal. Checking support history next.`
+
+        3. Keep these reasoning lines concise - one sentence each. Place them on their own line, prefixed with `> ` (markdown blockquote).
+
+        ## Final Report Format
+
+        When the investigation is complete, output a markdown report with these sections:
+
+        ## Investigation Summary
+
+        **Transaction:** TXN-XXXX  |  **Customer:** CUST-XXXX (Name)
+        **Classification:** ACCOUNT TAKEOVER | CARD NOT PRESENT | SYNTHETIC IDENTITY | ...
+        **Confidence:** LOW | MEDIUM | HIGH | CRITICAL
+        **Fraud Score:** XX / 100
+
+        ## Anomaly Signals (N detected)
+
+        - **Spending anomaly** - $X vs avg $Y (Zx)
+        - **Device anomaly** - unknown device fingerprint
+        - **Geographic anomaly** - Miami shipping vs Chicago profile
+        - ...
+
+        ## Action Taken
+
+        - Transaction held / released / flagged for manual review
+        - Customer notified via email
+        - ...
+
+        ## Recommendation
+
+        One or two sentences on next steps.
+
+        Use proper markdown: bold for labels, bullet lists for signals, headings for sections.
+        Be thorough but concise. Correlate signals across systems.
+        """
+
+        app = BedrockAgentCoreApp()
+
+        @app.entrypoint
+        async def invoke(payload):
+            print(f"[AGENT] Received: {payload}", flush=True)
+            user_input = payload.get("prompt", "")
+            if not user_input:
+                yield {"error": "No prompt provided"}
+                return
+            try:
+                token = get_gateway_token()
+                print("[AGENT] Got gateway token", flush=True)
+                gateway_client = MCPClient(
+                    lambda: streamablehttp_client(
+                        url=GATEWAY_URL,
+                        headers={"Authorization": f"Bearer {token}"}
+                    ),
+                    prefix="gateway",
+                )
+                print("[AGENT] MCP client created", flush=True)
+                with gateway_client:
+                    mcp_tools = gateway_client.list_tools_sync()
+                    print(f"[AGENT] Discovered {len(list(mcp_tools))} tools", flush=True)
+                    all_tools = list(mcp_tools)
+                    model = BedrockModel(model_id=BEDROCK_MODEL_ID,
+                        region_name=AWS_REGION)
+                    agent = Agent(model=model,
+                        tools=all_tools,
+                        system_prompt=SYSTEM_PROMPT)
+                    print("[AGENT] Streaming response...", flush=True)
+                    async for event in agent.stream_async(user_input):
+                        yield json.loads(json.dumps(dict(event), default=str))
+            except Exception as e:
+                print(f"[AGENT ERROR] {e}", flush=True)
+                traceback.print_exc()
+                yield {"error": str(e)}
+
+        if __name__ == "__main__":
+            print("[AGENT] Calling app.run()", flush=True)
+            app.run()
+
+
+  # =========================================================================
+  # 17. AGENTCORE RUNTIME - Fraud Investigation Agent (container from ECR)
+  # =========================================================================
+  AgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-agent-runtime-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: AgentRuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Invoke any foundation model or inference profile. Scoped to
+              # Bedrock model resources rather than a blanket "*", but left
+              # model-agnostic so the runtime's dynamic model resolver can fall
+              # back to the latest available Claude if a model is deprecated.
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:*:inference-profile/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:*:knowledge-base/*'
+              # ListInferenceProfiles is an account-level read with no IAM
+              # resource-level support; required by the dynamic model resolver.
+              - Effect: Allow
+                Action:
+                  - bedrock:ListInferenceProfiles
+                Resource: '*'
+              # Marketplace subscription checks do not support resource-level
+              # scoping; required for on-demand model access.
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt AgentEcrRepo.Arn
+              # The ECR repository is encrypted with the workshop customer-managed
+              # key, so the runtime role needs Decrypt to pull the agent image.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt WorkshopKmsKey.Arn
+              # GetAuthorizationToken returns an account-level token; must be "*".
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:log-group:/aws/bedrock-agentcore/*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt CognitoUserPool.Arn
+
+  FraudInvestigationRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn:
+      - AgentSourceUploaderTrigger
+    Properties:
+      AgentRuntimeName: !Sub '${StackPrefix}_investigation_agent'
+      Description: Fraud investigation agent with auto-discovered MCP tools
+      RoleArn: !GetAtt AgentRuntimeRole.Arn
+      ProtocolConfiguration: HTTP
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      EnvironmentVariables:
+        KNOWLEDGE_BASE_ID: !Ref FraudKnowledgeBase
+        AWS_REGION: !Ref AWS::Region
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        GATEWAY_URL: !GetAtt FraudGateway.GatewayUrl
+        COGNITO_DOMAIN: !Sub '${StackPrefix}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'
+        COGNITO_CLIENT_ID: !Ref CognitoMachineClient
+        COGNITO_SCOPE: !Sub '${StackPrefix}-gateway/invoke'
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub '${AgentEcrRepo.RepositoryUri}:latest'
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/openid-configuration'
+          AllowedClients:
+            - !Ref CognitoUserPoolClient
+      Tags:
+        Workshop: mcp-fraud-lab
+
+
+  # =========================================================================
+  # 18. SECRET INJECTOR - Fetches machine client secret, updates Runtime env
+  # =========================================================================
+  SecretInjectorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-secret-injector-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecretInjectorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt CognitoUserPool.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:UpdateAgentRuntime
+                  - bedrock-agentcore:GetAgentRuntime
+                Resource: !GetAtt FraudInvestigationRuntime.AgentRuntimeArn
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt AgentRuntimeRole.Arn
+
+  SecretInjectorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-secret-injector'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt SecretInjectorRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt FunctionDlq.Arn
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref CognitoUserPool
+          MACHINE_CLIENT_ID: !Ref CognitoMachineClient
+          RUNTIME_ID: !GetAtt FraudInvestigationRuntime.AgentRuntimeId
+          RUNTIME_ARN: !GetAtt FraudInvestigationRuntime.AgentRuntimeArn
+          KB_ID: !Ref FraudKnowledgeBase
+          GATEWAY_URL: !GetAtt FraudGateway.GatewayUrl
+          MODEL_ID: !Ref BedrockModelId
+          COGNITO_DOMAIN: !Sub '${StackPrefix}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'
+          COGNITO_SCOPE: !Sub '${StackPrefix}-gateway/invoke'
+          ROLE_ARN: !GetAtt AgentRuntimeRole.Arn
+          ECR_URI: !Sub '${AgentEcrRepo.RepositoryUri}:latest'
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          import urllib3
+          http = urllib3.PoolManager()
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
+          def send_cfn(event, context, status, data=None):
+              body = json.dumps({
+                  "Status": status, "Reason": "See CloudWatch",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {}
+              })
+              http.request("PUT", event["ResponseURL"], body=body,
+                          headers={"content-type": ""})
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send_cfn(event, context, SUCCESS)
+                  return
+              try:
+                  cognito = boto3.client('cognito-idp')
+                  resp = cognito.describe_user_pool_client(
+                      UserPoolId=os.environ['USER_POOL_ID'],
+                      ClientId=os.environ['MACHINE_CLIENT_ID']
+                  )
+                  secret = resp['UserPoolClient']['ClientSecret']
+                  print(f"Got client secret (length: {len(secret)})")
+
+                  ac = boto3.client('bedrock-agentcore-control')
+                  # Fetch current runtime config to preserve authorizer
+                  current = ac.get_agent_runtime(agentRuntimeId=os.environ['RUNTIME_ID'])
+                  authorizer = current.get('authorizerConfiguration')
+
+                  update_params = {
+                      'agentRuntimeId': os.environ['RUNTIME_ID'],
+                      'agentRuntimeArtifact': {
+                          'containerConfiguration': {
+                              'containerUri': os.environ['ECR_URI']
+                          }
+                      },
+                      'networkConfiguration': {'networkMode': 'PUBLIC'},
+                      'roleArn': os.environ['ROLE_ARN'],
+                      'environmentVariables': {
+                          'KNOWLEDGE_BASE_ID': os.environ['KB_ID'],
+                          'AWS_REGION': os.environ.get('AWS_DEFAULT_REGION', 'us-west-2'),
+                          'BEDROCK_MODEL_ID': os.environ['MODEL_ID'],
+                          'GATEWAY_URL': os.environ['GATEWAY_URL'],
+                          'COGNITO_DOMAIN': os.environ['COGNITO_DOMAIN'],
+                          'COGNITO_CLIENT_ID': os.environ['MACHINE_CLIENT_ID'],
+                          'COGNITO_CLIENT_SECRET': secret,
+                          'COGNITO_SCOPE': os.environ['COGNITO_SCOPE'],
+                      }
+                  }
+                  if authorizer:
+                      update_params['authorizerConfiguration'] = authorizer
+                      print(f"Preserving authorizer: {authorizer}")
+
+                  ac.update_agent_runtime(**update_params)
+                  print("Runtime env vars updated with secret")
+                  send_cfn(event, context, SUCCESS, {"Message": "Secret injected"})
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  send_cfn(event, context, FAILED, {"Error": str(e)})
+
+  SecretInjectorTrigger:
+    Type: Custom::SecretInjector
+    DependsOn:
+      - FraudInvestigationRuntime
+      - CognitoMachineClient
+      - CognitoUserPoolDomain
+    Properties:
+      ServiceToken: !GetAtt SecretInjectorFunction.Arn
+      Version: '5'
+
+
+  # =========================================================================
+  # 19. AMPLIFY DEPLOY - Deploys pre-built dashboard to Amplify
+  # =========================================================================
+  AmplifyDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${StackPrefix}-${AWS::Region}-amplify-deploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AmplifyDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - amplify:CreateDeployment
+                  - amplify:StartDeployment
+                  - amplify:GetJob
+                  - amplify:ListJobs
+                Resource: !Sub 'arn:${AWS::Partition}:amplify:${AWS::Region}:${AWS::AccountId}:apps/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${SeedStagingBucket}/*'
+
+  AmplifyDeployFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-amplify-deploy'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 180
+      MemorySize: 512
+      Role: !GetAtt AmplifyDeployRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt FunctionDlq.Arn
+      Environment:
+        Variables:
+          APP_ID: !GetAtt FraudDashboardApp.AppId
+          BRANCH_NAME: main
+          SOURCE_BUCKET: !Ref SeedStagingBucket
+          SOURCE_KEY: dashboard/build.zip
+          REPLACE_COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+          REPLACE_AGENT_RUNTIME_ARN: !GetAtt FraudInvestigationRuntime.AgentRuntimeArn
+          REPLACE_REGION: !Ref AWS::Region
+          REPLACE_INVESTIGATION_API: !Sub 'https://${InvestigationApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+          REPLACE_SUPPORT_API: !Sub 'https://${SupportApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+          REPLACE_COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      Code:
+        ZipFile: |
+          import json, os, io, zipfile, boto3, urllib3, time
+          import urllib.request
+          http = urllib3.PoolManager()
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
+          def send_cfn(event, context, status, data=None):
+              body = json.dumps({
+                  "Status": status, "Reason": "See CloudWatch",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {}
+              })
+              http.request("PUT", event["ResponseURL"], body=body,
+                          headers={"content-type": ""})
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send_cfn(event, context, SUCCESS)
+                  return
+              try:
+                  amplify = boto3.client('amplify')
+                  s3 = boto3.client('s3')
+                  app_id = os.environ['APP_ID']
+                  branch = os.environ['BRANCH_NAME']
+                  bucket = os.environ['SOURCE_BUCKET']
+                  key = os.environ['SOURCE_KEY']
+
+                  # Replacement map: placeholder -> real value
+                  replacements = {
+                      "PLACEHOLDER_COGNITO_CLIENT_ID": os.environ['REPLACE_COGNITO_CLIENT_ID'],
+                      "PLACEHOLDER_AGENT_RUNTIME_ARN": os.environ['REPLACE_AGENT_RUNTIME_ARN'],
+                      "PLACEHOLDER_REGION": os.environ['REPLACE_REGION'],
+                      "PLACEHOLDER_INVESTIGATION_API": os.environ['REPLACE_INVESTIGATION_API'],
+                      "PLACEHOLDER_SUPPORT_API": os.environ['REPLACE_SUPPORT_API'],
+                      "PLACEHOLDER_COGNITO_USER_POOL_ID": os.environ['REPLACE_COGNITO_USER_POOL_ID'],
+                  }
+
+                  # Download zip from S3
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  zip_data = obj['Body'].read()
+                  print(f"Downloaded zip: {len(zip_data)} bytes")
+
+                  # Unzip, replace placeholders in JS files, re-zip
+                  in_zip = zipfile.ZipFile(io.BytesIO(zip_data), 'r')
+                  out_buf = io.BytesIO()
+                  with zipfile.ZipFile(out_buf, 'w', zipfile.ZIP_DEFLATED) as out_zip:
+                      for name in in_zip.namelist():
+                          data = in_zip.read(name)
+                          if name.endswith('.js') or name.endswith('.html'):
+                              text = data.decode('utf-8')
+                              for placeholder, real_val in replacements.items():
+                                  text = text.replace(placeholder, real_val)
+                              data = text.encode('utf-8')
+                          out_zip.writestr(name, data)
+                  in_zip.close()
+                  patched_zip = out_buf.getvalue()
+                  print(f"Patched zip: {len(patched_zip)} bytes, replacements applied")
+
+                  # Create deployment and get upload URL
+                  deploy = amplify.create_deployment(appId=app_id, branchName=branch)
+                  job_id = deploy['jobId']
+                  zip_url = deploy['zipUploadUrl']
+                  print(f"Created deployment job: {job_id}")
+
+                  # Upload patched zip to Amplify
+                  req = urllib.request.Request(
+                      zip_url, data=patched_zip, method='PUT',
+                      headers={'Content-Type': 'application/zip'})
+                  urllib.request.urlopen(req)
+                  print("Uploaded patched zip to Amplify")
+
+                  # Start deployment
+                  amplify.start_deployment(appId=app_id, branchName=branch, jobId=job_id)
+                  print("Deployment started")
+
+                  # Wait for completion
+                  for _ in range(30):
+                      time.sleep(5)
+                      job = amplify.get_job(appId=app_id, branchName=branch, jobId=job_id)
+                      status = job['job']['summary']['status']
+                      print(f"Status: {status}")
+                      if status == 'SUCCEED':
+                          send_cfn(event, context, SUCCESS, {"JobId": job_id})
+                          return
+                      if status in ('FAILED', 'CANCELLED'):
+                          send_cfn(event, context, FAILED, {"Error": f"Deploy {status}"})
+                          return
+                  send_cfn(event, context, SUCCESS, {"JobId": job_id, "Note": "Still deploying"})
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  send_cfn(event, context, FAILED, {"Error": str(e)})
+
+  AmplifyDeployTrigger:
+    Type: Custom::AmplifyDeploy
+    DependsOn:
+      - FraudDashboardApp
+      - FraudDashboardBranch
+      - FraudInvestigationRuntime
+      - SecretInjectorTrigger
+      - SeedBootstrapTrigger
+    Properties:
+      ServiceToken: !GetAtt AmplifyDeployFunction.Arn
+      Version: '6'
+
+Outputs:
+  # ─── Essentials only - clean console view ─────────────────────────
+  FraudDashboardURL:
+    Description: 1. Open this URL in your browser
+    Value: !Sub 'https://main.${FraudDashboardApp.DefaultDomain}'
+
+  WorkshopUsername:
+    Description: 2. Login email
+    Value: !Sub '${StackPrefix}-admin@workshop.aws'
+
+  WorkshopPasswordSecret:
+    Description: 3. Run "aws secretsmanager get-secret-value --secret-id <this> --region us-west-2 --query SecretString --output text"
+    Value: !Ref WorkshopUserPassword

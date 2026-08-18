@@ -1,0 +1,4 @@
+[
+  {"case_id":"SC-4401","customer_id":"CUST-2847","date":"2025-10-15","subject":"Unauthorized $350 charge on my account","description":"Customer reported a charge they did not make. Investigation confirmed unauthorized access. Refund issued within 48 hours.","resolution":"Refund issued, card replaced","status":"resolved","category":"unauthorized_charge"},
+  {"case_id":"SC-4402","customer_id":"CUST-2847","date":"2025-10-16","subject":"Password reset request - did not initiate","description":"Customer received password reset email they did not request. Account secured with new password and MFA enabled.","resolution":"Password reset, MFA enabled","status":"resolved","category":"account_security"}
+]

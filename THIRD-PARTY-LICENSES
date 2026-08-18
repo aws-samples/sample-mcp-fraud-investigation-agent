@@ -1,0 +1,58 @@
+Third-Party Licenses
+
+This sample does not vendor (bundle) third-party source code in a modified form.
+The dependencies below are fetched at build time (by pip for the agent
+container, by npm for the dashboard) and the container base image is pulled from
+the public Amazon ECR mirror. They are listed here for transparency and
+attribution. Versions reflect the pinned values in the sources noted; consumers
+who adapt this sample should confirm current versions and licenses.
+
+Agent runtime, Python (assets/agent/requirements.txt, also embedded in the
+CloudFormation template build step)
+--------------------------------------------------------------------------
+bedrock-agentcore
+  License: Apache-2.0
+  Project: https://github.com/aws/bedrock-agentcore-sdk-python
+
+strands-agents
+  License: Apache-2.0
+  Project: https://github.com/strands-agents/sdk-python
+
+strands-agents-tools
+  License: Apache-2.0
+  Project: https://github.com/strands-agents/tools
+
+boto3
+  License: Apache-2.0
+  Project: https://github.com/boto/boto3
+
+botocore
+  License: Apache-2.0
+  Project: https://github.com/boto/botocore
+
+mcp (Model Context Protocol Python SDK)
+  License: MIT
+  Project: https://github.com/modelcontextprotocol/python-sdk
+
+requests
+  License: Apache-2.0
+  Project: https://github.com/psf/requests
+
+Dashboard, JavaScript (assets/dashboard/package.json)
+-----------------------------------------------------
+The dashboard is a Create React App project. Its dependencies (including react
+and react-dom, MIT; react-scripts, MIT; and their transitive dependencies) are
+resolved and fetched by npm at build time per package.json and
+package-lock.json. Refer to those files and each package's repository for the
+authoritative license of every transitive dependency.
+
+Container base image (assets/agent/Dockerfile)
+-----------------------------------------------
+python:3.12-slim (pulled from public.ecr.aws/docker/library/python)
+  Python interpreter: PSF License
+  Debian base OS packages: various (predominantly GPL, LGPL, and permissive
+    licenses per Debian)
+
+Note: no prebuilt container image is distributed in this repository. Consumers
+build the image themselves from the Dockerfile at deploy time, at which point
+the licenses above apply to their locally built artifact.

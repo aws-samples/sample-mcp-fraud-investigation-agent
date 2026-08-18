@@ -1,0 +1,23 @@
+ACCOUNT TAKEOVER RESPONSE PROTOCOL
+
+Definition: Account takeover (ATO) occurs when an unauthorized party gains access to a customer account through credential theft, phishing, or session hijacking.
+
+Detection Criteria:
+- 3 or more anomaly signals from different categories = HIGH CONFIDENCE account takeover
+- Anomaly categories: spending pattern, shipping address, device fingerprint, login time, credential changes, support history
+
+Required Actions for HIGH CONFIDENCE ATO:
+1. HOLD all pending transactions immediately
+2. FREEZE account for further review
+3. NOTIFY customer via verified contact method (phone on file, not email)
+4. ESCALATE to fraud team with full investigation report
+
+Escalation Rules:
+- Prior support cases for unauthorized activity INCREASE confidence score by 20%
+- Password change from new IP within 24 hours of suspicious transaction = CRITICAL indicator
+- Multiple anomaly signals from same session = coordinated attack pattern
+
+Response Time SLA:
+- HIGH CONFIDENCE: Action within 5 minutes
+- MEDIUM CONFIDENCE: Review within 30 minutes
+- LOW CONFIDENCE: Flag for daily review
