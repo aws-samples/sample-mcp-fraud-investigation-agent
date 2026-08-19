@@ -18,6 +18,10 @@ you do not have to build anything to try it. The source for the agent, the
 dashboard, and the seed data is also in `assets/` so you can read exactly how it
 works and rebuild the bundle yourself.
 
+## Demo
+
+![The agent investigating a flagged transaction and streaming its reasoning live in the dashboard](docs/demo.gif)
+
 ## The story
 
 Fraud analysts do not lack data, they lack time. A single "is this charge
